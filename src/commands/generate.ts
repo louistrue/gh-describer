@@ -3,7 +3,7 @@ import { GitHubService } from '../services/github';
 import { OpenRouterService } from '../services/openrouter';
 import { RepositoryAnalyzer } from '../services/analyzer';
 import { displayBanner, displayRepoTable, displaySuggestions, displaySuccess, displayError, displayBatchResults, displayInfo } from '../utils/ui';
-import { Repository, DescriptionSuggestion, BatchProcessResult } from '../types';
+import { Repository, DescriptionSuggestion, BatchProcessResult, LLMResponse } from '../types';
 import chalk from 'chalk';
 import ora from 'ora';
 
@@ -42,6 +42,85 @@ export async function generateCommand(options: { batch?: boolean; username?: str
     displayError(error.message);
     process.exit(1);
   }
+}
+
+async function refineWithFeedback(
+  repo: Repository,
+  suggestions: LLMResponse[],
+  openrouter: OpenRouterService
+): Promise<string | null> {
+  // Let user select a starting suggestion
+  const startingChoice = await select({
+    message: 'Select a suggestion to refine:',
+    choices: suggestions.map((s, i) => ({
+      name: `${i + 1}. ${s.model}: ${s.description.substring(0, 60)}...`,
+      value: i,
+    })),
+  });
+
+  let currentDescription = suggestions[startingChoice].description;
+  let iteration = 0;
+  const maxIterations = 5;
+
+  while (iteration < maxIterations) {
+    console.log(chalk.cyan.bold(`\n📝 Current description:`));
+    console.log(chalk.white(currentDescription));
+    console.log(chalk.gray(`(${currentDescription.length} characters)\n`));
+
+    const action = await select({
+      message: 'What would you like to do?',
+      choices: [
+        { name: '✅ Accept this description', value: 'accept' },
+        { name: '🔄 Refine with feedback', value: 'refine' },
+        { name: '↩️  Go back to suggestions', value: 'back' },
+      ],
+    });
+
+    if (action === 'accept') {
+      return currentDescription;
+    }
+
+    if (action === 'back') {
+      return null;
+    }
+
+    // Get feedback from user
+    const feedback = await input({
+      message: 'Enter your feedback (e.g., "make it shorter", "add more technical details", "mention TypeScript"):',
+    });
+
+    if (!feedback.trim()) {
+      displayInfo('No feedback provided, keeping current description');
+      continue;
+    }
+
+    // Refine with AI
+    const spinner = ora('Refining description with AI...').start();
+    try {
+      const refined = await openrouter.refineDescription(repo, currentDescription, feedback);
+      spinner.succeed('Description refined');
+      currentDescription = refined.description;
+      iteration++;
+    } catch (error: any) {
+      spinner.fail(`Refinement failed: ${error.message}`);
+      const shouldContinue = await confirm({
+        message: 'Try again with different feedback?',
+        default: true,
+      });
+      if (!shouldContinue) {
+        return null;
+      }
+    }
+  }
+
+  // Max iterations reached, ask if they want to accept current or go back
+  console.log(chalk.yellow(`\n⚠️  Reached maximum refinements (${maxIterations})`));
+  const accept = await confirm({
+    message: 'Accept current description?',
+    default: true,
+  });
+
+  return accept ? currentDescription : null;
 }
 
 async function interactiveGenerate(
@@ -88,7 +167,7 @@ async function interactiveGenerate(
         value: `use_${i}`,
       })),
       new Separator(),
-      { name: 'Edit/combine suggestions', value: 'edit' },
+      { name: 'Refine with AI feedback', value: 'refine' },
       { name: 'Skip this repository', value: 'skip' },
     ],
   });
@@ -100,12 +179,13 @@ async function interactiveGenerate(
 
   let finalDescription: string;
 
-  if (action === 'edit') {
-    // Let user edit
-    finalDescription = await input({
-      message: 'Enter the final description:',
-      default: suggestions[0].description,
-    });
+  if (action === 'refine') {
+    // Let user refine with AI feedback
+    const refined = await refineWithFeedback(selectedRepo, suggestions, openrouter);
+    if (!refined) {
+      return; // User cancelled
+    }
+    finalDescription = refined;
   } else {
     // Use selected suggestion
     const index = parseInt(action.split('_')[1]);
@@ -147,51 +227,94 @@ async function batchGenerate(
   analyzer: RepositoryAnalyzer
 ) {
   displayInfo(`Batch mode: Processing ${repos.length} repositories`);
-
-  const confirm_batch = await confirm({
-    message: `This will generate and apply descriptions to ${repos.length} repositories. Continue?`,
-    default: false,
-  });
-
-  if (!confirm_batch) {
-    displayInfo('Batch processing cancelled');
-    return;
-  }
-
-  // Ask which model to use for batch processing
-  const models = openrouter.getGenerateModels();
-  const selectedModel = await select({
-    message: 'Select which AI model to use for batch generation:',
-    choices: models.map((m, i) => ({
-      name: m.name,
-      value: i,
-    })),
-  });
+  displayInfo('For each repository, multiple AI models will generate suggestions in parallel for your review.');
 
   const results: BatchProcessResult[] = [];
 
   for (let i = 0; i < repos.length; i++) {
     const repo = repos[i];
-    console.log(chalk.cyan(`\n[${i + 1}/${repos.length}] Processing ${repo.name}...`));
+    console.log(chalk.cyan.bold(`\n[${i + 1}/${repos.length}] Processing ${repo.name}...`));
 
     try {
       // Analyze repository
       const analysis = await analyzer.analyzeRepository(repo);
 
-      // Generate description with selected model
-      const spinner = ora(`Generating description...`).start();
-      const suggestion = await openrouter.generateDescription(analysis, models[selectedModel]);
-      spinner.succeed('Description generated');
+      // Generate descriptions with multiple LLMs in parallel
+      const suggestions = await openrouter.generateMultipleDescriptions(analysis);
+
+      const descSuggestion: DescriptionSuggestion = {
+        repo,
+        current: repo.description,
+        suggestions,
+      };
+
+      // Display suggestions
+      displaySuggestions(descSuggestion);
+
+      // Let user choose
+      const choices = [
+        ...suggestions.map((s, idx) => ({
+          name: `Use suggestion ${idx + 1} from ${s.model}`,
+          value: `use_${idx}`,
+        })),
+        new Separator(),
+        { name: 'Refine with AI feedback', value: 'refine' },
+        { name: 'Skip this repository', value: 'skip' },
+        { name: chalk.red.bold('Stop batch processing'), value: 'stop' },
+      ];
+
+      const action = await select({
+        message: 'What would you like to do?',
+        choices,
+      });
+
+      if (action === 'stop') {
+        displayInfo('Batch processing stopped by user.');
+        break;
+      }
+
+      if (action === 'skip') {
+        displayInfo('Skipped');
+        results.push({
+          repo,
+          success: false,
+          error: 'Skipped by user',
+        });
+        continue;
+      }
+
+      let finalDescription: string | null = null;
+      if (action === 'refine') {
+        // Let user refine with AI feedback
+        const refined = await refineWithFeedback(repo, suggestions, openrouter);
+        if (!refined) {
+          results.push({
+            repo,
+            success: false,
+            error: 'Refinement cancelled by user',
+          });
+          continue;
+        }
+        finalDescription = refined;
+      } else {
+        const idx = parseInt(action.split('_')[1]);
+        finalDescription = suggestions[idx].description;
+      }
+
+      if (!finalDescription) {
+        continue;
+      }
 
       // Update repository
       const [owner, repoName] = repo.full_name.split('/');
-      await github.updateRepositoryDescription(owner, repoName, suggestion.description);
+      await github.updateRepositoryDescription(owner, repoName, finalDescription);
+      displaySuccess(`Updated ${repo.name}`);
 
       results.push({
         repo,
         success: true,
         oldDescription: repo.description,
-        newDescription: suggestion.description,
+        newDescription: finalDescription,
       });
 
     } catch (error: any) {
@@ -199,13 +322,20 @@ async function batchGenerate(
       results.push({
         repo,
         success: false,
-        oldDescription: repo.description,
-        newDescription: null,
         error: error.message,
       });
+
+      const shouldContinue = await confirm({
+        message: 'An error occurred. Continue with next repository?',
+        default: true
+      });
+
+      if (!shouldContinue) break;
     }
   }
 
   // Display batch results
-  displayBatchResults(results);
+  if (results.length > 0) {
+    displayBatchResults(results);
+  }
 }

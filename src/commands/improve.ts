@@ -158,126 +158,111 @@ async function batchImprove(
   github: GitHubService,
   openrouter: OpenRouterService
 ) {
-  displayInfo(`Batch mode: Processing ${repos.length} repositories`);
-
-  const confirmBatch = await confirm({
-    message: `This will analyze and improve descriptions for ${repos.length} repositories. Continue?`,
-    default: false,
-  });
-
-  if (!confirmBatch) {
-    displayInfo('Batch processing cancelled');
-    return;
-  }
-
-  // Ask which model to use for batch processing
-  const models = openrouter.getImproveModels();
-  const selectedModel = await select({
-    message: 'Select which AI model to use for batch improvements:',
-    choices: models.map((m, i) => ({
-      name: m.name,
-      value: i,
-    })),
-  });
-
-  // Ask for auto-apply or review
-  const autoApply = await confirm({
-    message: 'Automatically apply improvements? (No = review each suggestion)',
-    default: false,
-  });
+  displayInfo(`Batch mode: Improving ${repos.length} repositories`);
+  displayInfo('For each repository, multiple AI models will suggest improvements in parallel for your review.');
 
   const results: BatchProcessResult[] = [];
-  const reviewQueue: Array<{repo: Repository, oldDesc: string, newDesc: string}> = [];
 
   for (let i = 0; i < repos.length; i++) {
     const repo = repos[i];
-    console.log(chalk.cyan(`\n[${i + 1}/${repos.length}] Processing ${repo.name}...`));
+    console.log(chalk.cyan.bold(`\n[${i + 1}/${repos.length}] Processing ${repo.name}...`));
 
     try {
-      // Generate improvement with selected model
-      const spinner = ora(`Generating improvement...`).start();
-      const suggestion = await openrouter.improveDescription(
+      // Analyze repository - for improvement we might just use basic info unless openrouter.improve needs analysis
+      // Note: OpenRouterService.improveMultipleDescriptions only takes repo and currentDescription
+      const suggestions = await openrouter.improveMultipleDescriptions(
         repo,
-        repo.description!,
-        models[selectedModel]
+        repo.description!
       );
-      spinner.succeed('Improvement generated');
 
-      if (autoApply) {
-        // Automatically apply
-        const [owner, repoName] = repo.full_name.split('/');
-        await github.updateRepositoryDescription(owner, repoName, suggestion.description);
+      const descSuggestion: DescriptionSuggestion = {
+        repo,
+        current: repo.description,
+        suggestions,
+      };
 
+      // Display suggestions with reasoning
+      displaySuggestions(descSuggestion);
+
+      // Show comparison table
+      console.log(chalk.cyan.bold('📊 Side-by-Side Comparison:\n'));
+      displayComparisonTable([
+        { model: 'Current', description: repo.description! },
+        ...suggestions,
+      ]);
+
+      // Let user choose
+      const choices = [
+        { name: 'Keep current description (no changes)', value: 'keep' },
+        new Separator(),
+        ...suggestions.map((s, idx) => ({
+          name: `Use suggestion ${idx + 1} from ${s.model}`,
+          value: `use_${idx}`,
+        })),
+        new Separator(),
+        { name: 'Create custom description', value: 'custom' },
+        { name: 'Skip this repository', value: 'skip' },
+        { name: chalk.red.bold('Stop batch processing'), value: 'stop' },
+      ];
+
+      const action = await select({
+        message: 'What would you like to do?',
+        choices,
+      });
+
+      if (action === 'stop') {
+        displayInfo('Batch processing stopped by user.');
+        break;
+      }
+
+      if (action === 'skip' || action === 'keep') {
+        const msg = action === 'skip' ? 'Skipped' : 'Keeping current description';
+        displayInfo(msg);
         results.push({
           repo,
-          success: true,
-          oldDescription: repo.description,
-          newDescription: suggestion.description,
+          success: false,
+          error: msg,
+        });
+        continue;
+      }
+
+      let finalDescription: string;
+      if (action === 'custom') {
+        finalDescription = await input({
+          message: 'Enter your custom description:',
+          default: repo.description!,
         });
       } else {
-        // Queue for review
-        reviewQueue.push({
-          repo,
-          oldDesc: repo.description!,
-          newDesc: suggestion.description,
-        });
+        const idx = parseInt(action.split('_')[1]);
+        finalDescription = suggestions[idx].description;
       }
+
+      // Update repository
+      const [owner, repoName] = repo.full_name.split('/');
+      await github.updateRepositoryDescription(owner, repoName, finalDescription);
+      displaySuccess(`Improved ${repo.name}`);
+
+      results.push({
+        repo,
+        success: true,
+        oldDescription: repo.description,
+        newDescription: finalDescription,
+      });
 
     } catch (error: any) {
       console.error(chalk.red(`Error: ${error.message}`));
       results.push({
         repo,
         success: false,
-        oldDescription: repo.description,
-        newDescription: null,
         error: error.message,
       });
-    }
-  }
 
-  // If not auto-apply, review queue
-  if (!autoApply && reviewQueue.length > 0) {
-    console.log(chalk.cyan.bold(`\n\n📋 Review ${reviewQueue.length} improvements:\n`));
-
-    for (const item of reviewQueue) {
-      console.log(chalk.cyan.bold(`\n📦 ${item.repo.name}`));
-      console.log(chalk.yellow('Before: ') + chalk.white(item.oldDesc));
-      console.log(chalk.green('After:  ') + chalk.white(item.newDesc));
-
-      const shouldApply = await confirm({
-        message: 'Apply this improvement?',
-        default: true,
+      const shouldContinue = await confirm({
+        message: 'An error occurred. Continue with next repository?',
+        default: true
       });
 
-      if (shouldApply) {
-        try {
-          const [owner, repoName] = item.repo.full_name.split('/');
-          await github.updateRepositoryDescription(owner, repoName, item.newDesc);
-
-          results.push({
-            repo: item.repo,
-            success: true,
-            oldDescription: item.oldDesc,
-            newDescription: item.newDesc,
-          });
-        } catch (error: any) {
-          results.push({
-            repo: item.repo,
-            success: false,
-            oldDescription: item.oldDesc,
-            newDescription: null,
-            error: error.message,
-          });
-        }
-      } else {
-        results.push({
-          repo: item.repo,
-          success: false,
-          oldDescription: item.oldDesc,
-          newDescription: null,
-          error: 'Skipped by user',
-        });
-      }
+      if (!shouldContinue) break;
     }
   }
 

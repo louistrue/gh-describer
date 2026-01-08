@@ -58,7 +58,7 @@ export interface AppConfig {
 export interface BatchProcessResult {
   repo: Repository;
   success: boolean;
-  oldDescription: string | null;
-  newDescription: string | null;
+  oldDescription?: string | null;
+  newDescription?: string | null;
   error?: string;
 }

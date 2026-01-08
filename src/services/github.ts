@@ -80,24 +80,30 @@ export class GitHubService {
       const files: FileContent[] = [];
 
       if (Array.isArray(data)) {
-        // It's a directory
-        for (const item of data) {
+        // Prepare promises for parallel fetching
+        const fetchPromises = data.map(async (item) => {
           if (item.type === 'file' && this.shouldIncludeFile(item.name)) {
             try {
-              const fileContent = await this.getFileContent(owner, repo, item.path);
-              if (fileContent) {
-                files.push(fileContent);
-              }
+              return await this.getFileContent(owner, repo, item.path);
             } catch (error) {
-              // Skip files that can't be read
-              console.log(chalk.gray(`  Skipping ${item.path}`));
+              return null;
             }
           } else if (item.type === 'dir' && !this.shouldSkipDirectory(item.name)) {
             // Recursively get files from subdirectories (limited depth)
-            if (path.split('/').length < 3) {
-              const subFiles = await this.getRepositoryFiles(owner, repo, item.path);
-              files.push(...subFiles);
+            if (path.split('/').length < 2) { // Reduced depth for speed
+              return await this.getRepositoryFiles(owner, repo, item.path);
             }
+          }
+          return null;
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        for (const res of results) {
+          if (Array.isArray(res)) {
+            files.push(...res);
+          } else if (res) {
+            files.push(res);
           }
         }
       }
@@ -151,6 +157,12 @@ export class GitHubService {
       spinner.succeed(`Updated ${chalk.green(repo)}`);
     } catch (error: any) {
       spinner.fail(`Failed to update ${repo}`);
+      if (error.message.includes('Resource not accessible')) {
+        throw new Error(
+          `Permission Denied: Your Fine-grained token lacks 'Metadata' write access.\n` +
+          `Please go to GitHub settings, edit your token, and under "Repository permissions", set "Metadata" to "Read and write".`
+        );
+      }
       throw new Error(`Failed to update repository: ${error.message}`);
     }
   }
@@ -172,7 +184,7 @@ export class GitHubService {
     const lowerFilename = filename.toLowerCase();
 
     return extensions.some(ext => lowerFilename.endsWith(ext)) ||
-           importantFiles.some(name => lowerFilename.includes(name.toLowerCase()));
+      importantFiles.some(name => lowerFilename.includes(name.toLowerCase()));
   }
 
   private shouldSkipDirectory(dirname: string): boolean {
@@ -193,7 +205,7 @@ export class GitHubService {
 
       // Prioritize certain files
       const priorityFiles = ['README.md', 'readme.md', 'package.json', 'Cargo.toml',
-                             'setup.py', 'requirements.txt', 'go.mod', 'pom.xml'];
+        'setup.py', 'requirements.txt', 'go.mod', 'pom.xml'];
 
       const important = allFiles.filter(file =>
         priorityFiles.some(pf => file.path.toLowerCase().includes(pf.toLowerCase()))
